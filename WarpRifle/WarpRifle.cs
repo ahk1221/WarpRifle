@@ -7,6 +7,12 @@ using UnityEngine;
 
 namespace WarpRifle
 {
+    public class TransformInfo
+    {
+        public Vector3 Position;
+        public Quaternion Rotation;
+    }
+
     [RequireComponent(typeof(EnergyMixin))]
     public class WarpRifle : PlayerTool
     {
@@ -30,6 +36,8 @@ namespace WarpRifle
         public GameObject grabbedObject;
 
         public Animator animator;
+
+        private static List<GameObject> checkedObjects = new List<GameObject>();
 
         public void Init()
         {
@@ -64,6 +72,8 @@ namespace WarpRifle
             if (grabbedObject == null)
             {
                 grabbedObject = TraceForGrabTarget();
+                if (grabbedObject == null)
+                    Console.WriteLine("Did not pass pickupable check");
             }
 
             return true;
@@ -82,7 +92,13 @@ namespace WarpRifle
             if (grabbedObject != null)
             {
                 SafeAnimator.SetBool(animator, "use_loop", false);
-                WarpObject(grabbedObject, GetNewPos());
+
+                var transformInfo = GetNewPos(grabbedObject.transform);
+
+                WarpObject(grabbedObject, transformInfo.Position, transformInfo.Rotation);
+                grabbedObject.AddComponent<WarpedObject>();
+
+                grabbedObject = null;
             }
 
             return base.OnLeftHandUp();
@@ -96,12 +112,9 @@ namespace WarpRifle
 
             nextFire = Time.time + fireRate;
 
-            var newPos = GetNewPos();
-
-            WarpObject(Player.main.gameObject, newPos);
+            var transformInfo = GetNewPos(Player.main.transform);
+            WarpObject(Player.main.gameObject, transformInfo.Position, Quaternion.identity);
             
-            this.energyMixin.ConsumeEnergy(4f);
-
             return true;
         }
 
@@ -112,23 +125,127 @@ namespace WarpRifle
 
         public GameObject TraceForGrabTarget()
         {
-            var aimingTransform = Player.main.camRoot.GetAimingTransform();
-            var go = default(GameObject);
-            var dist = 0f;
+            var position = MainCamera.camera.transform.position;
+            var layerMask = ~(1 << LayerMask.NameToLayer("Player"));
+            var amountOfObjs = UWE.Utils.SpherecastIntoSharedBuffer(position, 1.2f, MainCamera.camera.transform.forward, 18f, layerMask, QueryTriggerInteraction.UseGlobal);
+            var result = default(GameObject);
+            var infinity = float.PositiveInfinity;
+            checkedObjects.Clear();
 
-            if(Targeting.GetTarget(Player.main.gameObject, 30f, out go, out dist))
+            for (int i = 0; i < amountOfObjs; i++)
             {
-                var rb = go.GetComponent<Rigidbody>();
-                if (rb == null || rb.mass > 1200f) return null;
-
-                var pickupable = go.GetComponent<Pickupable>();
-                if (pickupable != null) return pickupable.attached ? go : null;
+                var raycastHit = UWE.Utils.sharedHitBuffer[i];
+                if (!raycastHit.collider.isTrigger || raycastHit.collider.gameObject.layer == LayerMask.NameToLayer("Useable"))
+                {
+                    GameObject entityRoot = UWE.Utils.GetEntityRoot(raycastHit.collider.gameObject);
+                    if (entityRoot != null && !checkedObjects.Contains(entityRoot))
+                    {
+                        if (entityRoot.GetComponentInParent<PropulseCannonAmmoHandler>() == null)
+                        {
+                            var sqrMagnitude = (raycastHit.point - position).sqrMagnitude;
+                            if (sqrMagnitude < infinity && ValidateNewObject(entityRoot, raycastHit.point))
+                            {
+                                result = entityRoot;
+                                infinity = sqrMagnitude;
+                            }
+                        }
+                        checkedObjects.Add(entityRoot);
+                    }
+                }
             }
 
-            return null;
+            return result;
         }
 
-        public static void WarpObject(GameObject obj, Vector3 newPos)
+        public bool ValidateNewObject(GameObject go, Vector3 hitPos, bool checkLineOfSight = true)
+        {
+            if (!ValidateObject(go))
+            {
+                return false;
+            }
+
+            if (checkLineOfSight && !CheckLineOfSight(go, MainCamera.camera.transform.position, hitPos))
+            {
+                return false;
+            }
+
+            if (go.GetComponent<Pickupable>() != null)
+            {
+                return true;
+            }
+
+            var aabb = GetAABB(go);
+            return aabb.size.x * aabb.size.y * aabb.size.z <= 120f;
+        }
+
+        private bool ValidateObject(GameObject go)
+        {
+            if (!go.activeSelf || !go.activeInHierarchy)
+            {
+                Debug.Log("object is inactive");
+                return false;
+            }
+
+            Rigidbody component = go.GetComponent<Rigidbody>();
+            if (component == null || component.mass > 1200)
+            {
+                return false;
+            }
+
+            Pickupable component2 = go.GetComponent<Pickupable>();
+            bool flag = false;
+            if (component2 != null)
+            {
+                flag = component2.attached;
+            }
+
+            return !flag;
+        }
+
+        private Bounds GetAABB(GameObject target)
+        {
+            var component = target.GetComponent<FixedBounds>();
+            var result = default(Bounds);
+
+            if (component != null)
+            {
+                result = component.bounds;
+            }
+            else
+            {
+                result = UWE.Utils.GetEncapsulatedAABB(target, 20);
+            }
+
+            return result;
+        }
+
+        private bool CheckLineOfSight(GameObject obj, Vector3 a, Vector3 b)
+        {
+            bool result = true;
+            int num = UWE.Utils.RaycastIntoSharedBuffer(a, Vector3.Normalize(b - a), (b - a).magnitude, ~(1 << LayerMask.NameToLayer("Player")), QueryTriggerInteraction.Ignore);
+            bool flag = false;
+            for (int i = 0; i < num; i++)
+            {
+                if (flag)
+                {
+                    break;
+                }
+                GameObject gameObject = UWE.Utils.GetEntityRoot(UWE.Utils.sharedHitBuffer[i].collider.gameObject);
+                if (!gameObject)
+                {
+                    gameObject = UWE.Utils.sharedHitBuffer[i].collider.gameObject;
+                }
+                Player componentInChildren = gameObject.GetComponentInChildren<Player>();
+                if (componentInChildren == null && gameObject != obj)
+                {
+                    result = false;
+                    flag = true;
+                }
+            }
+            return result;
+        }
+
+        public void WarpObject(GameObject obj, Vector3 newPos, Quaternion newRot)
         {
             // Warp out.
             Utils.SpawnPrefabAt(warpOutEffectPrefab, null, obj.transform.position);
@@ -136,31 +253,41 @@ namespace WarpRifle
 
             // Warp in
             obj.transform.position = newPos;
+            obj.transform.rotation = newRot == Quaternion.identity ? obj.transform.rotation : newRot;
             Utils.SpawnPrefabAt(warpInEffectPrefab, null, newPos);
             obj.AddComponent<VFXOverlayMaterial>().ApplyAndForgetOverlay(warpedMaterial, "VFXOverlay: Warped", Color.clear, overlayFXDuration);
             Utils.PlayEnvSound(warpOutSound, obj.transform.position, 20f);
+
+            energyMixin.ConsumeEnergy(4f);
         }
 
-        public static Vector3 GetNewPos()
+        public TransformInfo GetNewPos(Transform obj)
         {
-            var aimingTransform = Player.main.camRoot.GetAimingTransform();
-            var dist = 0f;
-            var go = default(GameObject);
-            var hitSomething = Targeting.GetTarget(Player.main.gameObject, 30, out go, out dist, null);
+            var layerMask = ~(1 << LayerMask.NameToLayer("Player"));
+
+            var num = UWE.Utils.RaycastIntoSharedBuffer(new Ray(
+                MainCamera.camera.transform.position, 
+                MainCamera.camera.transform.forward),
+                float.PositiveInfinity, layerMask,
+                QueryTriggerInteraction.UseGlobal);
 
             var newPos = Vector3.zero;
+            var newRot = Quaternion.identity;
 
-            if (hitSomething)
+            for(int i = 0; i < num; i++)
             {
-                newPos = aimingTransform.forward * (dist - 1f) + aimingTransform.position;
-            }
-            else
-            {
-                newPos = aimingTransform.forward * 30f + aimingTransform.position;
+                var hitInfo = UWE.Utils.sharedHitBuffer[i];
+                var dist = Vector3.Distance(MainCamera.camera.transform.position, hitInfo.point);
+                newPos = MainCamera.camera.transform.forward * (dist - 1f) + MainCamera.camera.transform.position;
+
+                newRot = Quaternion.FromToRotation(obj.up, hitInfo.normal);
+
+                return new TransformInfo() { Position = newPos, Rotation = newRot };
             }
 
-            return newPos;
+            newPos = MainCamera.camera.transform.forward * 30f + MainCamera.camera.transform.position;
+
+            return new TransformInfo() { Position = newPos, Rotation = Quaternion.identity };
         }
-
     }
 }
